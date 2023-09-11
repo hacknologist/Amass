@@ -1,4 +1,4 @@
-// Copyright © by Jeff Foley 2017-2022. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -9,19 +9,19 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/limits"
-	amassnet "github.com/OWASP/Amass/v3/net"
-	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/resources"
 	"github.com/caffix/netmap"
-	"github.com/caffix/resolve"
 	"github.com/caffix/service"
+	amassnet "github.com/owasp-amass/amass/v4/net"
+	"github.com/owasp-amass/amass/v4/requests"
+	"github.com/owasp-amass/amass/v4/resources"
+	"github.com/owasp-amass/config/config"
+	"github.com/owasp-amass/resolve"
 )
 
 // LocalSystem implements a System to be executed within a single process.
@@ -43,30 +43,24 @@ func NewLocalSystem(cfg *config.Config) (*LocalSystem, error) {
 		return nil, err
 	}
 
-	var set bool
-	if cfg.MaxDNSQueries == 0 {
-		set = true
-	}
-
-	max := int(float64(limits.GetFileLimit()) * 0.7)
-	trusted, num := trustedResolvers(cfg, max)
-	if trusted == nil {
+	trusted, num := trustedResolvers(cfg)
+	if trusted == nil || num == 0 {
 		return nil, errors.New("the system was unable to build the pool of trusted resolvers")
 	}
-	max -= num
-	if set {
-		cfg.MaxDNSQueries += num * cfg.TrustedQPS
-	}
 
-	pool, num := untrustedResolvers(cfg, max)
-	if pool == nil {
+	pool, num := untrustedResolvers(cfg)
+	if pool == nil || num == 0 {
 		return nil, errors.New("the system was unable to build the pool of untrusted resolvers")
 	}
-	if set {
+	if cfg.MaxDNSQueries == 0 {
 		cfg.MaxDNSQueries += num * cfg.ResolversQPS
 	} else {
-		pool.AddMaxQPS(cfg.MaxDNSQueries)
+		pool.SetMaxQPS(cfg.MaxDNSQueries)
 	}
+	// set a single name server rate limiter for both resolver pools
+	rate := resolve.NewRateTracker()
+	trusted.SetRateTracker(rate)
+	pool.SetRateTracker(rate)
 
 	sys := &LocalSystem{
 		Cfg:        cfg,
@@ -89,7 +83,7 @@ func NewLocalSystem(cfg *config.Config) (*LocalSystem, error) {
 		return nil, err
 	}
 	// Setup the correct graph database handler
-	if err := sys.setupGraphDBs(); err != nil {
+	if err := sys.setupGraphDBs(cfg); err != nil {
 		_ = sys.Shutdown()
 		return nil, err
 	}
@@ -144,15 +138,15 @@ func (l *LocalSystem) DataSources() []service.Service {
 
 // SetDataSources assigns the data sources that will be used by the system.
 func (l *LocalSystem) SetDataSources(sources []service.Service) error {
-	f := func(src service.Service, ch chan error) { ch <- l.AddAndStart(src) }
-
 	ch := make(chan error, len(sources))
 	// Add all the data sources that successfully start to the list
 	for _, src := range sources {
-		go f(src, ch)
+		go func(src service.Service, ch chan error) {
+			ch <- l.AddAndStart(src)
+		}(src, ch)
 	}
 
-	t := time.NewTimer(30 * time.Second)
+	t := time.NewTimer(time.Minute)
 	defer t.Stop()
 
 	var err error
@@ -192,9 +186,8 @@ func (l *LocalSystem) Shutdown() error {
 
 	wg.Wait()
 	close(l.done)
-
-	for _, g := range l.GraphDatabases() {
-		g.Close()
+	for range l.GraphDatabases() {
+		//g.Close()
 	}
 
 	l.pool.Stop()
@@ -219,27 +212,32 @@ func (l *LocalSystem) setupOutputDirectory() error {
 }
 
 // Select the graph that will store the System findings.
-func (l *LocalSystem) setupGraphDBs() error {
-	cfg := l.Config()
+func (l *LocalSystem) setupGraphDBs(cfg *config.Config) error {
+	// Add the local database settings to the configuration
+	cfg.GraphDBs = append(cfg.GraphDBs, cfg.LocalDatabaseSettings(cfg.GraphDBs))
 
-	var dbs []*config.Database
-	if db := cfg.LocalDatabaseSettings(cfg.GraphDBs); db != nil {
-		dbs = append(dbs, db)
+	for _, db := range cfg.GraphDBs {
+		if db.Primary {
+			var g *netmap.Graph
+
+			if db.System == "local" {
+				g = netmap.NewGraph(db.System, filepath.Join(config.OutputDirectory(cfg.Dir), "amass.sqlite"), db.Options)
+			} else {
+				connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s", db.Host, db.Port, db.Username, db.Password, db.DBName)
+				g = netmap.NewGraph(db.System, connStr, db.Options)
+			}
+
+			if g == nil {
+				return fmt.Errorf("System: failed to create the graph for database: %s", db.System)
+			}
+
+			l.graphs = append(l.graphs, g)
+			break
+		}
 	}
-	dbs = append(dbs, cfg.GraphDBs...)
 
-	for _, db := range dbs {
-		cayley := netmap.NewCayleyGraph(db.System, db.URL, db.Options)
-		if cayley == nil {
-			return fmt.Errorf("System: Failed to create the %s graph", db.System)
-		}
-
-		g := netmap.NewGraph(cayley)
-		if g == nil {
-			return fmt.Errorf("System: Failed to create the %s graph", g.String())
-		}
-
-		l.graphs = append(l.graphs, g)
+	if len(l.graphs) == 0 {
+		return errors.New("System: no primary databases found to create the graph")
 	}
 	return nil
 }
@@ -296,70 +294,60 @@ func (l *LocalSystem) loadCacheData() error {
 	return nil
 }
 
-func trustedResolvers(cfg *config.Config, max int) (*resolve.Resolvers, int) {
-	var num int
+func trustedResolvers(cfg *config.Config) (*resolve.Resolvers, int) {
 	pool := resolve.NewResolvers()
-
+	trusted := config.DefaultBaselineResolvers
 	if len(cfg.TrustedResolvers) > 0 {
-		num = len(cfg.TrustedResolvers)
-		_ = pool.AddResolvers(cfg.TrustedQPS, cfg.TrustedResolvers...)
-	} else {
-		num = len(config.DefaultBaselineResolvers)
-		_ = pool.AddResolvers(cfg.TrustedQPS, config.DefaultBaselineResolvers...)
-		pool.SetDetectionResolver(cfg.TrustedQPS, "8.8.8.8")
+		trusted = cfg.TrustedResolvers
 	}
 
-	pool.AddLogger(cfg.Log)
-	return pool, num
+	_ = pool.AddResolvers(cfg.TrustedQPS, trusted...)
+	pool.SetDetectionResolver(cfg.TrustedQPS, "8.8.8.8")
+
+	pool.SetLogger(cfg.Log)
+	pool.SetTimeout(2 * time.Second)
+	return pool, pool.Len()
 }
 
-func untrustedResolvers(cfg *config.Config, max int) (*resolve.Resolvers, int) {
-	if max <= 0 {
-		return nil, 0
+func untrustedResolvers(cfg *config.Config) (*resolve.Resolvers, int) {
+	if len(cfg.Resolvers) == 0 {
+		cfg.Resolvers = publicResolverAddrs(cfg)
+		if len(cfg.Resolvers) == 0 {
+			// Failed to use the public DNS resolvers database
+			cfg.Resolvers = config.DefaultBaselineResolvers
+		}
 	}
-	if len(cfg.Resolvers) > 0 {
-		return customResolverSetup(cfg, max)
-	}
-	return publicResolverSetup(cfg, max)
-}
-
-func customResolverSetup(cfg *config.Config, max int) (*resolve.Resolvers, int) {
-	num := len(cfg.Resolvers)
-	if num > max {
-		num = max
-		cfg.Resolvers = cfg.Resolvers[:num]
-	}
+	cfg.Resolvers = checkAddresses(cfg.Resolvers)
 
 	pool := resolve.NewResolvers()
-	pool.AddLogger(cfg.Log)
+	pool.SetLogger(cfg.Log)
+	if cfg.MaxDNSQueries > 0 {
+		pool.SetMaxQPS(cfg.MaxDNSQueries)
+	}
 	_ = pool.AddResolvers(cfg.ResolversQPS, cfg.Resolvers...)
-	return pool, num
+	pool.SetTimeout(3 * time.Second)
+	pool.SetThresholdOptions(&resolve.ThresholdOptions{
+		ThresholdValue:      20,
+		CountTimeouts:       true,
+		CountFormatErrors:   true,
+		CountServerFailures: true,
+		CountNotImplemented: true,
+		CountQueryRefusals:  true,
+	})
+	pool.ClientSubnetCheck()
+	return pool, pool.Len()
 }
 
-func publicResolverSetup(cfg *config.Config, max int) (*resolve.Resolvers, int) {
+func publicResolverAddrs(cfg *config.Config) []string {
 	addrs := config.PublicResolvers
-	num := len(config.PublicResolvers)
 
-	if num == 0 {
+	if len(config.PublicResolvers) == 0 {
 		if err := config.GetPublicDNSResolvers(); err != nil {
 			cfg.Log.Printf("%v", err)
-			return nil, 0
 		}
 		addrs = config.PublicResolvers
-		num = len(config.PublicResolvers)
 	}
-	if num > max {
-		num = max
-		addrs = addrs[:num]
-	}
-
-	addrs = checkAddresses(addrs)
-	addrs = runSubnetChecks(addrs)
-
-	r := resolve.NewResolvers()
-	r.AddLogger(cfg.Log)
-	_ = r.AddResolvers(cfg.ResolversQPS, addrs...)
-	return r, len(addrs)
+	return addrs
 }
 
 func checkAddresses(addrs []string) []string {
@@ -375,34 +363,6 @@ func checkAddresses(addrs []string) []string {
 			continue
 		}
 		ips = append(ips, net.JoinHostPort(ip, port))
-	}
-
-	return ips
-}
-
-func runSubnetChecks(addrs []string) []string {
-	finished := make(chan string, 10)
-
-	for _, addr := range addrs {
-		go func(ip string, ch chan string) {
-			if err := resolve.ClientSubnetCheck(ip); err == nil {
-				ch <- ip
-				return
-			}
-			ch <- ""
-		}(addr, finished)
-	}
-
-	l := len(addrs)
-	var ips []string
-	for i := 0; i < l; i++ {
-		if ip := <-finished; ip != "" {
-			ips = append(ips, ip)
-		}
-	}
-
-	if len(ips) == 0 {
-		return addrs
 	}
 	return ips
 }

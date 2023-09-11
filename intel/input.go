@@ -1,4 +1,4 @@
-// Copyright © by Jeff Foley 2017-2022. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -8,9 +8,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/OWASP/Amass/v3/requests"
 	"github.com/caffix/pipeline"
 	"github.com/caffix/queue"
+	"github.com/owasp-amass/amass/v4/requests"
 	bf "github.com/tylertreat/BoomFilters"
 )
 
@@ -57,24 +57,7 @@ func (r *intelSource) Next(ctx context.Context) bool {
 	default:
 	}
 
-	if !r.queue.Empty() {
-		return true
-	}
-
-	t := time.NewTimer(r.timeout)
-	defer t.Stop()
-
-	for {
-		select {
-		case <-t.C:
-			close(r.done)
-			return false
-		case <-r.queue.Signal():
-			if !r.queue.Empty() {
-				return true
-			}
-		}
-	}
+	return !r.queue.Empty()
 }
 
 // Data implements the pipeline InputSource interface.

@@ -1,4 +1,4 @@
-// Copyright © by Jeff Foley 2017-2022. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -12,30 +12,28 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/datasrcs"
-	amassnet "github.com/OWASP/Amass/v3/net"
-	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/systems"
-	eb "github.com/caffix/eventbus"
 	"github.com/caffix/pipeline"
-	"github.com/caffix/resolve"
 	"github.com/caffix/service"
 	"github.com/caffix/stringset"
+	"github.com/owasp-amass/amass/v4/datasrcs"
+	amassnet "github.com/owasp-amass/amass/v4/net"
+	"github.com/owasp-amass/amass/v4/requests"
+	"github.com/owasp-amass/amass/v4/systems"
+	"github.com/owasp-amass/config/config"
+	"github.com/owasp-amass/resolve"
 	bf "github.com/tylertreat/BoomFilters"
 	"golang.org/x/net/publicsuffix"
 )
 
 const (
-	maxDnsPipelineTasks    int = 15000
-	maxActivePipelineTasks int = 25
+	maxDnsPipelineTasks    int = 2000
+	maxActivePipelineTasks int = 50
 )
 
 // Collection is the object type used to execute a open source information gathering with Amass.
 type Collection struct {
 	sync.Mutex
 	Config            *config.Config
-	Bus               *eb.EventBus
 	Sys               systems.System
 	ctx               context.Context
 	srcs              []service.Service
@@ -50,7 +48,6 @@ type Collection struct {
 func NewCollection(cfg *config.Config, sys systems.System) *Collection {
 	return &Collection{
 		Config:   cfg,
-		Bus:      eb.NewEventBus(),
 		Sys:      sys,
 		srcs:     datasrcs.SelectedDataSources(cfg, sys.DataSources()),
 		Output:   make(chan *requests.Output, 100),
@@ -79,18 +76,11 @@ func (c *Collection) HostedDomains(ctx context.Context) error {
 		return err
 	}
 
+	defer close(c.Output)
 	// Setup the context used throughout the collection
 	var cancel context.CancelFunc
-	ctx, cancel = context.WithCancel(ctx)
-	ctx = context.WithValue(ctx, requests.ContextConfig, c.Config)
-	ctx = context.WithValue(ctx, requests.ContextEventBus, c.Bus)
-	c.ctx = ctx
+	c.ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
-
-	go func() {
-		<-ctx.Done()
-		close(c.Output)
-	}()
 
 	var stages []pipeline.Stage
 	stages = append(stages, pipeline.DynamicPool("", c.makeDNSTaskFunc(), maxDnsPipelineTasks))
@@ -101,20 +91,18 @@ func (c *Collection) HostedDomains(ctx context.Context) error {
 
 	// Send IP addresses to the input source to scan for domain names
 	source := newIntelSource(c)
-	for _, addr := range c.Config.Addresses {
+	for _, addr := range c.Config.Scope.Addresses {
 		source.InputAddress(&requests.AddrRequest{Address: addr.String()})
 	}
-	for _, cidr := range append(c.Config.CIDRs, c.asnsToCIDRs()...) {
+	for _, cidr := range append(c.Config.Scope.CIDRs, c.asnsToCIDRs()...) {
 		// Skip IPv6 netblocks, since they are simply too large
 		if ip := cidr.IP.Mask(cidr.Mask); amassnet.IsIPv6(ip) {
 			continue
 		}
 
-		go func(n *net.IPNet) {
-			for _, addr := range amassnet.AllHosts(n) {
-				source.InputAddress(&requests.AddrRequest{Address: addr.String()})
-			}
-		}(cidr)
+		for _, addr := range amassnet.AllHosts(cidr) {
+			source.InputAddress(&requests.AddrRequest{Address: addr.String()})
+		}
 	}
 
 	return pipeline.NewPipeline(stages...).Execute(ctx, source, c.makeOutputSink())
@@ -168,8 +156,6 @@ func (c *Collection) makeDNSTaskFunc() pipeline.TaskFunc {
 						Name:      d,
 						Domain:    d,
 						Addresses: []requests.AddressInfo{addrinfo},
-						Tag:       requests.DNS,
-						Sources:   []string{"Reverse DNS"},
 					}, tp)
 				}
 			}
@@ -196,14 +182,14 @@ func (c *Collection) makeFilterTaskFunc() pipeline.TaskFunc {
 func (c *Collection) asnsToCIDRs() []*net.IPNet {
 	var cidrs []*net.IPNet
 
-	if len(c.Config.ASNs) == 0 {
+	if len(c.Config.Scope.ASNs) == 0 {
 		return cidrs
 	}
 
 	cidrSet := stringset.New()
 	defer cidrSet.Close()
 
-	for _, asn := range c.Config.ASNs {
+	for _, asn := range c.Config.Scope.ASNs {
 		req := c.Sys.Cache().ASNSearch(asn)
 
 		if req == nil {
@@ -221,7 +207,7 @@ func (c *Collection) asnsToCIDRs() []*net.IPNet {
 	defer filter.Reset()
 
 	// Do not return CIDRs that are already in the config
-	for _, cidr := range c.Config.CIDRs {
+	for _, cidr := range c.Config.Scope.CIDRs {
 		filter.Add([]byte(cidr.String()))
 	}
 
@@ -242,17 +228,23 @@ func (c *Collection) ReverseWhois() error {
 		return err
 	}
 
-	c.Bus.Subscribe(requests.NewWhoisTopic, c.collect)
-	defer c.Bus.Unsubscribe(requests.NewWhoisTopic, c.collect)
-
-	// Setup the context used throughout the collection
-	ctx := context.WithValue(context.Background(), requests.ContextConfig, c.Config)
-	c.ctx = context.WithValue(ctx, requests.ContextEventBus, c.Bus)
-
+	go func() {
+		for {
+			for _, src := range c.srcs {
+				select {
+				case req := <-src.Output():
+					if w, ok := req.(*requests.WhoisRequest); ok {
+						c.collect(w)
+					}
+				default:
+				}
+			}
+		}
+	}()
 	// Send the whois requests to the data sources
 	for _, src := range c.srcs {
 		for _, domain := range c.Config.Domains() {
-			src.Request(c.ctx, &requests.WhoisRequest{Domain: domain})
+			src.Input() <- &requests.WhoisRequest{Domain: domain}
 		}
 	}
 
@@ -284,10 +276,8 @@ func (c *Collection) collect(req *requests.WhoisRequest) {
 	for _, name := range req.NewDomains {
 		if d, err := publicsuffix.EffectiveTLDPlusOne(name); err == nil && !c.filter.TestAndAdd([]byte(d)) {
 			c.Output <- &requests.Output{
-				Name:    d,
-				Domain:  d,
-				Tag:     req.Tag,
-				Sources: []string{req.Source},
+				Name:   d,
+				Domain: d,
 			}
 		}
 	}

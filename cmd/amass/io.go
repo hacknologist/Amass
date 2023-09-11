@@ -1,4 +1,4 @@
-// Copyright © by Jeff Foley 2017-2022. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,64 +6,158 @@ package main
 
 import (
 	"context"
-	"math/rand"
+	"fmt"
 	"net"
+	"strconv"
 	"time"
 
-	"github.com/OWASP/Amass/v3/enum"
-	"github.com/OWASP/Amass/v3/requests"
 	"github.com/caffix/netmap"
-	"github.com/caffix/service"
-	bf "github.com/tylertreat/BoomFilters"
+	"github.com/caffix/stringset"
+	"github.com/owasp-amass/amass/v4/enum"
+	"github.com/owasp-amass/amass/v4/requests"
+	"github.com/owasp-amass/asset-db/types"
+	oam "github.com/owasp-amass/open-asset-model"
+	"github.com/owasp-amass/open-asset-model/domain"
+	"github.com/owasp-amass/open-asset-model/network"
 	"golang.org/x/net/publicsuffix"
 )
 
-var sourceTags map[string]string
+func NewOutput(ctx context.Context, g *netmap.Graph, e *enum.Enumeration, filter *stringset.Set, since time.Time) []string {
+	var output []string
 
-func init() {
-	sourceTags = make(map[string]string)
+	// Make sure a filter has been created
+	if filter == nil {
+		filter = stringset.New()
+		defer filter.Close()
+	}
+
+	var assets []*types.Asset
+	for _, atype := range []oam.AssetType{oam.FQDN, oam.IPAddress, oam.Netblock, oam.ASN, oam.RIROrg} {
+		if a, err := g.DB.FindByType(atype, since.UTC()); err == nil {
+			assets = append(assets, a...)
+		}
+	}
+
+	arrow := white("-->")
+	start := e.Config.CollectionStartTime.UTC()
+	for _, from := range assets {
+		fromstr := extractAssetName(from)
+
+		if rels, err := g.DB.OutgoingRelations(from, start); err == nil {
+			for _, rel := range rels {
+				lineid := from.ID + rel.ID + rel.ToAsset.ID
+				if filter.Has(lineid) {
+					continue
+				}
+				if to, err := g.DB.FindById(rel.ToAsset.ID, start); err == nil {
+					tostr := extractAssetName(to)
+
+					output = append(output, fmt.Sprintf("%s %s %s %s %s", fromstr, arrow, magenta(rel.Type), arrow, tostr))
+					filter.Insert(lineid)
+				}
+			}
+		}
+	}
+
+	return output
+}
+
+func extractAssetName(a *types.Asset) string {
+	var result string
+
+	switch a.Asset.AssetType() {
+	case oam.FQDN:
+		if fqdn, ok := a.Asset.(domain.FQDN); ok {
+			result = green(fqdn.Name) + blue(" (FQDN)")
+		}
+	case oam.IPAddress:
+		if ip, ok := a.Asset.(network.IPAddress); ok {
+			result = green(ip.Address.String()) + blue(" (IPAddress)")
+		}
+	case oam.ASN:
+		if asn, ok := a.Asset.(network.AutonomousSystem); ok {
+			result = green(strconv.Itoa(asn.Number)) + blue(" (ASN)")
+		}
+	case oam.RIROrg:
+		if rir, ok := a.Asset.(network.RIROrganization); ok {
+			result = green(rir.RIRId+rir.Name) + blue(" (RIROrganization)")
+		}
+	case oam.Netblock:
+		if nb, ok := a.Asset.(network.Netblock); ok {
+			result = green(nb.Cidr.String()) + blue(" (Netblock)")
+		}
+	}
+
+	return result
 }
 
 // ExtractOutput is a convenience method for obtaining new discoveries made by the enumeration process.
-func ExtractOutput(ctx context.Context, e *enum.Enumeration, filter *bf.StableBloomFilter, asinfo bool, limit int) []*requests.Output {
-	if e.Config.Passive {
-		return EventNames(ctx, e.Sys.GraphDatabases()[0], e.Config.UUID.String(), filter)
-	}
-
-	return EventOutput(ctx, e.Sys.GraphDatabases()[0], e.Config.UUID.String(), filter, asinfo, e.Sys.Cache(), limit)
+func ExtractOutput(ctx context.Context, g *netmap.Graph, e *enum.Enumeration, filter *stringset.Set, asinfo bool) []*requests.Output {
+	return EventOutput(ctx, g, e.Config.Domains(), e.Config.CollectionStartTime, filter, asinfo, e.Sys.Cache())
 }
 
 type outLookup map[string]*requests.Output
 
-// EventOutput returns findings within the receiver Graph for the event identified by the uuid string
-// parameter and not already in the filter argument. The filter is updated by EventOutput.
-func EventOutput(ctx context.Context, g *netmap.Graph, uuid string, f *bf.StableBloomFilter, asninfo bool, cache *requests.ASNCache, limit int) []*requests.Output {
+// EventOutput returns findings within the receiver Graph within the scope identified by the provided domain names.
+// The filter is updated by EventOutput.
+func EventOutput(ctx context.Context, g *netmap.Graph, domains []string, since time.Time, f *stringset.Set, asninfo bool, cache *requests.ASNCache) []*requests.Output {
+	var res []*requests.Output
+
+	if len(domains) == 0 {
+		return res
+	}
 	// Make sure a filter has been created
 	if f == nil {
-		f = bf.NewDefaultStableBloomFilter(1000000, 0.01)
-		defer func() { _ = f.Reset() }()
+		f = stringset.New()
+		defer f.Close()
 	}
 
-	var fqdns []string
-	for _, name := range g.EventFQDNs(ctx, uuid) {
-		if !f.Test([]byte(name)) {
-			fqdns = append(fqdns, name)
+	var fqdns []oam.Asset
+	for _, d := range domains {
+		fqdns = append(fqdns, domain.FQDN{Name: d})
+	}
+
+	qtime := time.Time{}
+	if !since.IsZero() {
+		qtime = since.UTC()
+	}
+
+	assets, err := g.DB.FindByScope(fqdns, qtime)
+	if err != nil {
+		return res
+	}
+
+	var names []string
+	for _, a := range assets {
+		if n, ok := a.Asset.(domain.FQDN); ok && !f.Has(n.Name) {
+			names = append(names, n.Name)
 		}
 	}
 
-	names := randomSelection(fqdns, limit)
 	lookup := make(outLookup, len(names))
-	for _, o := range buildNameInfo(ctx, g, uuid, names) {
-		lookup[o.Name] = o
+	for _, n := range names {
+		d, err := publicsuffix.EffectiveTLDPlusOne(n)
+		if err != nil {
+			continue
+		}
+
+		o := &requests.Output{
+			Name:   n,
+			Domain: d,
+		}
+		res = append(res, o)
+		lookup[n] = o
 	}
 	// Build the lookup map used to create the final result set
-	if pairs, err := g.NamesToAddrs(ctx, uuid, names...); err == nil {
+	if pairs, err := g.NamesToAddrs(ctx, qtime, names...); err == nil {
 		for _, p := range pairs {
-			if p.Name == "" || p.Addr == "" {
+			addr := p.Addr.Address.String()
+
+			if p.FQDN.Name == "" || addr == "" {
 				continue
 			}
-			if o, found := lookup[p.Name]; found {
-				o.Addresses = append(o.Addresses, requests.AddressInfo{Address: net.ParseIP(p.Addr)})
+			if o, found := lookup[p.FQDN.Name]; found {
+				o.Addresses = append(o.Addresses, requests.AddressInfo{Address: net.ParseIP(addr)})
 			}
 		}
 	}
@@ -74,34 +168,19 @@ func EventOutput(ctx context.Context, g *netmap.Graph, uuid string, f *bf.Stable
 	return addInfrastructureInfo(lookup, f, cache)
 }
 
-func randomSelection(names []string, limit int) []string {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	var sel []string
-	for i, n := range r.Perm(len(names)) {
-		if limit > 0 && i >= limit {
-			break
-		}
-
-		sel = append(sel, names[n])
-	}
-
-	return sel
-}
-
-func removeDuplicates(lookup outLookup, filter *bf.StableBloomFilter) []*requests.Output {
+func removeDuplicates(lookup outLookup, filter *stringset.Set) []*requests.Output {
 	output := make([]*requests.Output, 0, len(lookup))
 
 	for _, o := range lookup {
-		if !filter.TestAndAdd([]byte(o.Name)) {
+		if !filter.Has(o.Name) {
 			output = append(output, o)
+			filter.Insert(o.Name)
 		}
 	}
-
 	return output
 }
 
-func addInfrastructureInfo(lookup outLookup, filter *bf.StableBloomFilter, cache *requests.ASNCache) []*requests.Output {
+func addInfrastructureInfo(lookup outLookup, filter *stringset.Set, cache *requests.ASNCache) []*requests.Output {
 	output := make([]*requests.Output, 0, len(lookup))
 
 	for _, o := range lookup {
@@ -124,112 +203,61 @@ func addInfrastructureInfo(lookup outLookup, filter *bf.StableBloomFilter, cache
 		}
 
 		o.Addresses = newaddrs
-		if len(o.Addresses) > 0 && !filter.TestAndAdd([]byte(o.Name)) {
+		if len(o.Addresses) > 0 && !filter.Has(o.Name) {
 			output = append(output, o)
+			filter.Insert(o.Name)
 		}
 	}
-
 	return output
 }
 
-// EventNames returns findings within the receiver Graph for the event identified by the uuid string
-// parameter and not already in the filter argument. The filter is updated by EventNames.
-func EventNames(ctx context.Context, g *netmap.Graph, uuid string, f *bf.StableBloomFilter) []*requests.Output {
+// EventNames returns findings within the receiver Graph within the scope identified by the provided domain names.
+// The filter is updated by EventNames.
+func EventNames(ctx context.Context, g *netmap.Graph, domains []string, since time.Time, f *stringset.Set) []*requests.Output {
+	var res []*requests.Output
+
+	if len(domains) == 0 {
+		return res
+	}
 	// Make sure a filter has been created
 	if f == nil {
-		f = bf.NewDefaultStableBloomFilter(1000000, 0.01)
-		defer func() { _ = f.Reset() }()
+		f = stringset.New()
+		defer f.Close()
+	}
+
+	var fqdns []oam.Asset
+	for _, d := range domains {
+		fqdns = append(fqdns, domain.FQDN{Name: d})
+	}
+
+	qtime := time.Time{}
+	if !since.IsZero() {
+		qtime = since.UTC()
+	}
+
+	assets, err := g.DB.FindByScope(fqdns, qtime)
+	if err != nil {
+		return res
 	}
 
 	var names []string
-	for _, name := range g.EventFQDNs(ctx, uuid) {
-		if !f.Test([]byte(name)) {
-			names = append(names, name)
+	for _, a := range assets {
+		if n, ok := a.Asset.(domain.FQDN); ok && !f.Has(n.Name) {
+			names = append(names, n.Name)
+			f.Insert(n.Name)
 		}
 	}
 
-	var results []*requests.Output
-	for _, o := range buildNameInfo(ctx, g, uuid, names) {
-		if !f.TestAndAdd([]byte(o.Name)) {
-			results = append(results, o)
-		}
-	}
-	return results
-}
-
-func buildNameInfo(ctx context.Context, g *netmap.Graph, uuid string, names []string) []*requests.Output {
-	results := make(map[string]*requests.Output, len(names))
-
-	for _, name := range names {
-		if _, found := results[name]; found {
-			continue
-		}
-
-		n := netmap.Node(name)
-		if srcs, err := g.NodeSources(ctx, n, uuid); err == nil && len(srcs) > 0 {
-			results[name] = &requests.Output{
-				Name:    name,
-				Sources: srcs,
-			}
-		}
-	}
-
-	var final []*requests.Output
-	for _, o := range results {
-		d, err := publicsuffix.EffectiveTLDPlusOne(o.Name)
+	for _, n := range names {
+		d, err := publicsuffix.EffectiveTLDPlusOne(n)
 		if err != nil {
 			continue
 		}
-		o.Domain = d
 
-		o.Tag = selectTag(o.Sources)
-		final = append(final, o)
+		res = append(res, &requests.Output{
+			Name:   n,
+			Domain: d,
+		})
 	}
-	return final
-}
-
-func initializeSourceTags(srcs []service.Service) {
-	sourceTags["DNS"] = requests.DNS
-	sourceTags["Reverse DNS"] = requests.DNS
-	sourceTags["NSEC Walk"] = requests.DNS
-	sourceTags["DNS Zone XFR"] = requests.AXFR
-	sourceTags["Active Crawl"] = requests.CRAWL
-	sourceTags["Active Cert"] = requests.CERT
-
-	for _, src := range srcs {
-		sourceTags[src.String()] = src.Description()
-	}
-}
-
-func selectTag(sources []string) string {
-	var trusted, others []string
-
-	for _, src := range sources {
-		tag, found := sourceTags[src]
-		if !found {
-			continue
-		}
-
-		if requests.TrustedTag(tag) {
-			trusted = append(trusted, tag)
-		} else {
-			others = append(others, tag)
-		}
-	}
-
-	tags := others
-	if len(trusted) > 0 {
-		tags = trusted
-	}
-
-	if len(tags) == 0 {
-		return requests.DNS
-	}
-
-	sel := 0
-	if m := len(tags); m > 0 {
-		sel = rand.Int() % m
-	}
-
-	return tags[sel]
+	return res
 }

@@ -1,4 +1,4 @@
-// Copyright © by Jeff Foley 2021-2022. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -7,11 +7,11 @@ package systems
 import (
 	"runtime"
 
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/requests"
 	"github.com/caffix/netmap"
-	"github.com/caffix/resolve"
 	"github.com/caffix/service"
+	"github.com/owasp-amass/amass/v4/requests"
+	"github.com/owasp-amass/config/config"
+	"github.com/owasp-amass/resolve"
 )
 
 type SimpleSystem struct {
@@ -66,9 +66,9 @@ func (ss *SimpleSystem) Shutdown() error {
 	if ss.Service != nil {
 		_ = ss.Service.Stop()
 	}
-	if ss.Graph != nil {
+	/*if ss.Graph != nil {
 		ss.Graph.Close()
-	}
+	}*/
 	if ss.Pool != nil {
 		ss.Pool.Stop()
 	}

@@ -1,5 +1,6 @@
-// Copyright 2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package requests
 
@@ -33,8 +34,6 @@ func TestUpdate(t *testing.T) {
 		Address: "72.237.4.113",
 		ASN:     26808,
 		Prefix:  "72.237.4.0/24",
-		Tag:     RIR,
-		Source:  "RIR",
 	})
 
 	if entry := cache.AddrSearch("72.237.4.113"); entry == nil {
@@ -50,8 +49,6 @@ func TestUpdate(t *testing.T) {
 		AllocationDate: time.Now(),
 		Description:    "UTICA-COLLEGE",
 		Netblocks:      []string{"72.237.4.0/24", "8.24.68.0/23"},
-		Tag:            RIR,
-		Source:         "RIR",
 	})
 
 	if entry := cache.AddrSearch("72.237.4.113"); entry == nil || entry.CC != "US" || entry.Description != "UTICA-COLLEGE" {
@@ -73,8 +70,6 @@ func TestASNSearch(t *testing.T) {
 		Address: "72.237.4.113",
 		ASN:     26808,
 		Prefix:  "72.237.4.0/24",
-		Tag:     RIR,
-		Source:  "RIR",
 	})
 
 	if entry := cache.ASNSearch(26808); entry == nil {
@@ -101,8 +96,6 @@ func TestAddrSearch(t *testing.T) {
 		AllocationDate: time.Now(),
 		Description:    "UTICA-COLLEGE",
 		Netblocks:      []string{"72.237.4.0/24", "8.24.68.0/23"},
-		Tag:            RIR,
-		Source:         "RIR",
 	})
 
 	if entry := cache.AddrSearch("72.237.4.120"); entry == nil {

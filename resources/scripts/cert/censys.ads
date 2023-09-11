@@ -1,4 +1,4 @@
--- Copyright © by Jeff Foley 2020-2022. All rights reserved.
+-- Copyright © by Jeff Foley 2017-2023. All rights reserved.
 -- Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 -- SPDX-License-Identifier: Apache-2.0
 
@@ -11,10 +11,24 @@ function start()
     set_rate_limit(3)
 end
 
+function check()
+    local c
+    local cfg = datasrc_config()
+    if (cfg ~= nil) then
+        c = cfg.credentials
+    end
+
+    if (c ~= nil and c.key ~= nil and 
+        c.key ~= "" and c.secret ~= nil and c.secret ~= "") then
+        return true
+    end
+    return false
+end
+
 function vertical(ctx, domain)
     local c
     local cfg = datasrc_config()
-    if cfg ~= nil then
+    if (cfg ~= nil) then
         c = cfg.credentials
     end
 
@@ -29,8 +43,8 @@ function api_query(ctx, cfg, domain)
     local p = 1
 
     while(true) do
-        local err, body, resp
-        body, err = json.encode({
+        local err, resp, data
+        data, err = json.encode({
             ['query']="parsed.names: " .. domain, 
             ['page']=p,
             ['fields']={"parsed.names"},
@@ -40,20 +54,26 @@ function api_query(ctx, cfg, domain)
         end
     
         resp, err = request(ctx, {
-            method="POST",
-            data=body,
-            ['url']="https://www.censys.io/api/v1/search/certificates",
-            headers={['Content-Type']="application/json"},
-            id=cfg["credentials"].key,
-            pass=cfg["credentials"].secret,
+            ['url']="https://search.censys.io/api/v1/search/certificates",
+            ['method']="POST",
+            ['header']={['Content-Type']="application/json"},
+            ['body']=data,
+            ['id']=cfg["credentials"].key,
+            ['pass']=cfg["credentials"].secret,
         })
         if (err ~= nil and err ~= "") then
             log(ctx, "vertical request to service failed: " .. err)
             return
+        elseif (resp.status_code < 200 or resp.status_code >= 400) then
+            log(ctx, "vertical request to service returned with status code: " .. resp.status)
+            return
         end
 
-        local d = json.decode(resp)
-        if (d == nil or d.status ~= "ok" or #(d.results) == 0) then
+        local d = json.decode(resp.body)
+        if (d == nil) then
+            log(ctx, "failed to decode the JSON response")
+            return
+        elseif (d.status == nil or d.status ~= "ok" or #(d.results) == 0) then
             return
         end
 
@@ -66,7 +86,6 @@ function api_query(ctx, cfg, domain)
         if d["metadata"].page >= d["metadata"].pages then
             return
         end
-
         p = p + 1
     end
 end
